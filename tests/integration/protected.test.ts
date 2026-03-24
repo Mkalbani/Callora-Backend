@@ -4,6 +4,29 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import { createTestDb } from '../helpers/db.js';
 import { signTestToken, signExpiredToken, TEST_JWT_SECRET } from '../helpers/jwt.js';
+import { createApp } from '../../src/app.js';
+import { InMemoryUsageEventsRepository } from '../../src/repositories/usageEventsRepository.js';
+import { InMemoryVaultRepository } from '../../src/repositories/vaultRepository.js';
+import type { Developer } from '../../src/db/schema.js';
+import type { DeveloperRepository } from '../../src/repositories/developerRepository.js';
+import type { ApiRepository, ApiListFilters } from '../../src/repositories/apiRepository.js';
+
+jest.mock('uuid', () => ({ v4: () => 'mock-uuid-1234' }));
+
+// Mock better-sqlite3 to avoid native binding requirement in test env
+jest.mock('better-sqlite3', () => {
+  return class MockDatabase {
+    prepare() { return { get: () => null }; }
+    exec() { }
+    close() { }
+  };
+});
+
+// Mock the userRepository to avoid the Prisma import chain
+// (userRepository → lib/prisma → generated/prisma/client which doesn't exist in test env)
+jest.mock('../../src/repositories/userRepository', () => ({
+  findUsers: jest.fn().mockResolvedValue({ users: [], total: 0 }),
+}));
 
 function buildProtectedApp(pool: any) {
   const app = express();
@@ -107,5 +130,246 @@ describe('GET /api/usage - JWT protected', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toBe('No token provided');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requireAuth middleware – integration coverage against real createApp routes
+// ---------------------------------------------------------------------------
+
+const testDeveloper: Developer = {
+  id: 7,
+  user_id: 'user-42',
+  name: 'Integration Tester',
+  website: null,
+  description: null,
+  category: null,
+  created_at: new Date(0),
+  updated_at: new Date(0),
+};
+
+const stubDeveloperRepository: DeveloperRepository = {
+  async findByUserId(userId: string) {
+    return userId === testDeveloper.user_id ? testDeveloper : undefined;
+  },
+};
+
+class StubApiRepository implements ApiRepository {
+  async listByDeveloper(_developerId: number, _filters?: ApiListFilters) {
+    return [];
+  }
+  async findById() {
+    return null;
+  }
+  async getEndpoints() {
+    return [];
+  }
+}
+
+/**
+ * Build a createApp instance with lightweight in-memory stubs so that
+ * route handlers can execute without hitting a real database.
+ */
+function buildRealApp() {
+  const vaultRepo = new InMemoryVaultRepository();
+  return createApp({
+    usageEventsRepository: new InMemoryUsageEventsRepository(),
+    vaultRepository: vaultRepo,
+    developerRepository: stubDeveloperRepository,
+    apiRepository: new StubApiRepository(),
+    findDeveloperByUserId: async (id) => stubDeveloperRepository.findByUserId(id),
+    createApiWithEndpoints: async (input) => ({
+      id: 1,
+      developer_id: input.developer_id,
+      name: input.name,
+      description: input.description ?? null,
+      base_url: input.base_url,
+      logo_url: null,
+      category: input.category ?? null,
+      status: input.status ?? 'draft',
+      created_at: new Date(),
+      updated_at: new Date(),
+      endpoints: [],
+    }),
+  });
+}
+
+/** Standard assertion for an unauthenticated response from the errorHandler */
+function expectUnauthorized(res: request.Response) {
+  expect(res.status).toBe(401);
+  expect(res.body).toHaveProperty('error');
+  expect(res.body.error).toBe('Unauthorized');
+  expect(res.body.code).toBe('UNAUTHORIZED');
+}
+
+// Collect every protected endpoint so we can run the same failure-mode matrix
+// against each one without duplicating boilerplate.
+const protectedEndpoints: Array<{
+  method: 'get' | 'post' | 'delete';
+  path: string;
+  body?: Record<string, unknown>;
+}> = [
+  { method: 'get', path: '/api/developers/apis' },
+  { method: 'get', path: '/api/developers/analytics' },
+  { method: 'post', path: '/api/vault/deposit/prepare', body: { amount_usdc: '10.00' } },
+  { method: 'get', path: '/api/vault/balance' },
+  { method: 'delete', path: '/api/keys/nonexistent-id' },
+  { method: 'post', path: '/api/developers/apis', body: { name: 'Test', base_url: 'https://t.co', endpoints: [] } },
+];
+
+describe('requireAuth – rejects unauthenticated requests on all protected routes', () => {
+  let app: express.Express;
+
+  beforeAll(() => {
+    app = buildRealApp();
+  });
+
+  describe.each(protectedEndpoints)(
+    '$method $path',
+    ({ method, path, body }) => {
+      it('returns 401 when no auth headers are present', async () => {
+        const req = request(app)[method](path);
+        if (body) req.send(body);
+        const res = await req;
+        expectUnauthorized(res);
+      });
+
+      it('returns 401 when Bearer token is empty', async () => {
+        const req = request(app)[method](path).set('Authorization', 'Bearer ');
+        if (body) req.send(body);
+        const res = await req;
+        expectUnauthorized(res);
+      });
+
+      it('returns 401 when Bearer token is whitespace-only', async () => {
+        const req = request(app)[method](path).set('Authorization', 'Bearer    ');
+        if (body) req.send(body);
+        const res = await req;
+        expectUnauthorized(res);
+      });
+
+      it('returns 401 with non-Bearer scheme (Basic)', async () => {
+        const req = request(app)[method](path).set('Authorization', 'Basic dXNlcjpwYXNz');
+        if (body) req.send(body);
+        const res = await req;
+        expectUnauthorized(res);
+      });
+    },
+  );
+});
+
+describe('requireAuth – accepts valid credentials on protected routes', () => {
+  let app: express.Express;
+
+  beforeAll(() => {
+    app = buildRealApp();
+  });
+
+  it('authenticates via Bearer token on GET /api/developers/apis', async () => {
+    const res = await request(app)
+      .get('/api/developers/apis')
+      .set('Authorization', 'Bearer user-42');
+
+    // Auth passes; the route itself may return 200 (empty list) or 404 depending on developer lookup
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via x-user-id header on GET /api/developers/apis', async () => {
+    const res = await request(app)
+      .get('/api/developers/apis')
+      .set('x-user-id', 'user-42');
+
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via Bearer token on GET /api/developers/analytics', async () => {
+    const res = await request(app)
+      .get('/api/developers/analytics?from=2026-01-01&to=2026-01-31')
+      .set('Authorization', 'Bearer user-42');
+
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via x-user-id header on GET /api/developers/analytics', async () => {
+    const res = await request(app)
+      .get('/api/developers/analytics?from=2026-01-01&to=2026-01-31')
+      .set('x-user-id', 'user-42');
+
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via Bearer token on POST /api/vault/deposit/prepare', async () => {
+    const res = await request(app)
+      .post('/api/vault/deposit/prepare')
+      .set('Authorization', 'Bearer user-42')
+      .send({ amount_usdc: '10.00' });
+
+    // 404 (no vault) is acceptable — not 401
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via x-user-id header on GET /api/vault/balance', async () => {
+    const res = await request(app)
+      .get('/api/vault/balance')
+      .set('x-user-id', 'user-42');
+
+    // 404 (no vault) is acceptable — not 401
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via Bearer token on DELETE /api/keys/:id', async () => {
+    const res = await request(app)
+      .delete('/api/keys/nonexistent-id')
+      .set('Authorization', 'Bearer user-42');
+
+    // 204 (not_found falls through to 204 in current impl) — not 401
+    expect(res.status).not.toBe(401);
+  });
+
+  it('authenticates via x-user-id header on POST /api/developers/apis', async () => {
+    const res = await request(app)
+      .post('/api/developers/apis')
+      .set('x-user-id', 'user-42')
+      .send({ name: 'My API', base_url: 'https://example.com', endpoints: [] });
+
+    expect(res.status).not.toBe(401);
+  });
+});
+
+describe('requireAuth – error body consistency', () => {
+  let app: express.Express;
+
+  beforeAll(() => {
+    app = buildRealApp();
+  });
+
+  it('returns JSON content-type for 401 responses', async () => {
+    const res = await request(app).get('/api/developers/apis');
+
+    expect(res.status).toBe(401);
+    expect(res.headers['content-type']).toMatch(/application\/json/);
+  });
+
+  it('does not leak stack traces or internal details in 401 body', async () => {
+    const res = await request(app).get('/api/vault/balance');
+
+    expect(res.status).toBe(401);
+    expect(res.body).not.toHaveProperty('stack');
+    expect(res.body).not.toHaveProperty('statusCode');
+    // Only expected keys
+    const keys = Object.keys(res.body);
+    expect(keys).toEqual(expect.arrayContaining(['error', 'code']));
+    expect(keys.length).toBe(2);
+  });
+
+  it('produces identical error shape across different protected routes', async () => {
+    const res1 = await request(app).get('/api/developers/apis');
+    const res2 = await request(app).post('/api/vault/deposit/prepare').send({});
+    const res3 = await request(app).delete('/api/keys/abc');
+
+    for (const res of [res1, res2, res3]) {
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
+    }
   });
 });
